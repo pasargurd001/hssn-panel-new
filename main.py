@@ -71,6 +71,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Hosts that must never end up in generated config links.
+_BAD_HOSTS = {"", "0.0.0.0", "127.0.0.1", "localhost", "testserver", "::1", "[::1]"}
+
+
+@app.middleware("http")
+async def _capture_public_host(request: Request, call_next):
+    """Auto-detect the public domain from the incoming request so config and
+    subscription links never carry localhost when RAILWAY_PUBLIC_DOMAIN is
+    not set on the platform."""
+    if not os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        h = (request.headers.get("host") or "").split(":")[0].strip().lower().strip("[]")
+        if h and h not in _BAD_HOSTS and "." in h:
+            CONFIG["host"] = h
+    return await call_next(request)
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "hssn_state.json"
@@ -1536,7 +1551,12 @@ async def shutdown():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_host() -> str:
-    return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
+    h = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or CONFIG.get("host") or "localhost"
+    h = h.strip().lower()
+    for prefix in ("https://", "http://"):
+        if h.startswith(prefix):
+            h = h[len(prefix):]
+    return h.rstrip("/")
 
 
 def _safe_host(*candidates: str) -> str:
