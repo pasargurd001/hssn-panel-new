@@ -1664,6 +1664,30 @@ def fmt_bytes(b: int) -> str:
     if b < 1024**4: return f"{b/1024**3:.2f} GB"
     return f"{b/1024**4:.2f} TB"
 
+def sub_userinfo_value(used_bytes: int, limit_bytes: int, expire_at) -> str:
+    """Build the standard `Subscription-Userinfo` header value from REAL counters.
+
+    Format: `upload=0; download=<used>; total=<limit>; expire=<unix_ts>`.
+    `total=0` means unlimited, `expire=0` means never expires. Display-only:
+    only used for subscription response headers so client apps (V2RayNG,
+    Streisand, …) show the correct remaining volume and time.
+    """
+    try:
+        used = int(used_bytes or 0)
+    except Exception:
+        used = 0
+    try:
+        total = int(limit_bytes or 0)
+    except Exception:
+        total = 0
+    expire_ts = 0
+    if expire_at:
+        try:
+            expire_ts = int(datetime.fromisoformat(expire_at).timestamp())
+        except Exception:
+            expire_ts = 0
+    return f"upload=0; download={used}; total={total}; expire={expire_ts}"
+
 def client_ip(request: Request) -> str:
     """آی‌پی واقعی کلاینت رو با احتساب هدرهای پراکسی (Railway/Cloudflare) برمی‌گردونه."""
     fwd = request.headers.get("x-forwarded-for")
@@ -1965,17 +1989,16 @@ def generate_custom_ip_configs(user_id: str, user: dict) -> dict:
 
 
 def generate_status_config(user: dict, configs: list) -> str:
-    """Generate a status config (config-status) with fake random stats.
+    """Generate a status config (config-status) with the user's REAL stats.
 
     This config is placed FIRST in the subscription so clients display it as
     the status/overview config. It uses the panel's main domain and carries
-    fake volume/time/user-count in the remark for easy reading.
+    the user's real used/total volume, remaining days and live online count
+    in the remark for easy reading. Display-only: no core logic touched.
 
     The address is the panel domain (not external_domain) and host/sni are
     also the panel domain so TLS handshake reaches the panel.
     """
-    import random
-
     # Get user info
     username = user.get("username", "user")
     user_id = user.get("user_id", "")
@@ -1987,20 +2010,32 @@ def generate_status_config(user: dict, configs: list) -> str:
     else:
         panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
 
-    # Generate fake stats for the status config
-    # Random volume: 100GB - 500GB total, 10GB - 100GB used
-    total_gb = random.randint(100, 500)
-    used_gb = random.randint(10, min(100, total_gb - 1))
+    # Real stats from the user record (display only).
+    # Volume: bytes stored on the user; 0 limit means unlimited.
+    used_bytes = int(user.get("traffic_used_bytes", 0) or 0)
+    limit_bytes = int(user.get("traffic_limit_bytes", 0) or 0)
+    used_gb = used_bytes / 1024 ** 3
+    total_txt = f"{limit_bytes / 1024 ** 3:.2f}GB" if limit_bytes > 0 else "∞"
 
-    # Random expiry: 30-365 days
-    expire_days = random.randint(30, 365)
+    # Remaining time: days left until expire_at (ISO string); none means unlimited.
+    exp = user.get("expire_at")
+    if exp:
+        try:
+            days_txt = str(max((datetime.fromisoformat(exp) - datetime.now()).days, 0))
+        except Exception:
+            days_txt = "∞"
+    else:
+        days_txt = "∞"
 
-    # Random concurrent users: 1-10
-    online_users = random.randint(1, 10)
+    # Live online count for this user's configs (read-only snapshot).
+    try:
+        online_users = sum(1 for c in connections.values() if c.get("uuid") == config_uuid)
+    except Exception:
+        online_users = 0
 
-    # Build remark with fake stats (status config identifier)
+    # Build remark with real stats (status config identifier)
     # Format: "📊 Status | User: {username} | Used: {used}GB/{total}GB | Days: {days} | Online: {online}"
-    remark_text = f"📊 Status | User: {username} | Used: {used_gb}GB/{total_gb}GB | Days: {expire_days} | Online: {online_users}"
+    remark_text = f"📊 Status | User: {username} | Used: {used_gb:.2f}GB/{total_txt} | Days: {days_txt} | Online: {online_users}"
     remark = quote(remark_text)
 
     # Try to find a TLS WS/XHTTP config to copy transport from
@@ -2336,7 +2371,11 @@ async def subscription_handler(identifier: str, request: Request):
             return Response(content=content, media_type="text/plain",
                             headers={"profile-title": quote(username),
                                       "profile-update-interval": "12",
-                                      "support-url": "https://t.me/h33n313"})
+                                      "support-url": "https://t.me/h33n313",
+                                      "Subscription-Userinfo": sub_userinfo_value(
+                                          target_user.get("traffic_used_bytes", 0),
+                                          target_user.get("traffic_limit_bytes", 0),
+                                          target_user.get("expire_at"))})
 
         # Fallback: check LINKS (legacy link UUID)
         async with LINKS_LOCK:
@@ -2347,7 +2386,11 @@ async def subscription_handler(identifier: str, request: Request):
             vless = generate_vless_link(identifier, host, remark=f"HssN-{link['label']}", protocol=proto)
             content = base64.b64encode(vless.encode()).decode()
             return Response(content=content, media_type="text/plain",
-                            headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/h33n313"})
+                            headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/h33n313",
+                                      "Subscription-Userinfo": sub_userinfo_value(
+                                          link.get("used_bytes", 0),
+                                          link.get("limit_bytes", 0),
+                                          link.get("expires_at"))})
 
         raise HTTPException(status_code=404, detail="not found")
 
